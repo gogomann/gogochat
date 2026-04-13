@@ -12,6 +12,10 @@ import { toolRegistry } from './tool-registry';
 import { calculatorTool, handleCalculator } from '../tools/calculator';
 import { webSearchTool, handleWebSearch } from '../tools/web-search';
 
+// Media Tools (brauchen Capabilities)
+import { imageGenTool, handleImageGen } from '../tools/image-gen-tool';
+import { ttsTool, handleTTS } from '../tools/tts-tool';
+
 /**
  * Initialisiert alle Tools
  */
@@ -26,23 +30,24 @@ export function initializeTools(): void {
   toolRegistry.register(webSearchTool, handleWebSearch);
 
   // ============================================================================
-  // MEDIA TOOLS - Brauchen Capabilities
+  // MEDIA TOOLS - Brauchen konfigurierte Capabilities
   // ============================================================================
 
-  // TODO: Image-Gen Tool (Phase 5)
-  // TODO: TTS Tool (Phase 6)
-  // TODO: STT Tool (Phase 7)
+  toolRegistry.register(imageGenTool, handleImageGen);
+  toolRegistry.register(ttsTool, handleTTS);
 
   // ============================================================================
-  // SYSTEM TOOLS - Lokale Tools
+  // SYSTEM TOOLS - Lokale Tools (optional)
   // ============================================================================
 
-  // TODO: File-Reader Tool (optional)
-  // TODO: PDF-Extract Tool (optional)
-  // TODO: OCR Tool (optional)
+  // TODO: File-Reader Tool (braucht MCP Filesystem)
+  // TODO: PDF-Extract Tool
+  // TODO: OCR Tool
 
   const allTools = toolRegistry.getAllTools();
   const available = toolRegistry.getAvailableTools();
 
   console.log(`✅ Tool Registry initialized: ${available.length}/${allTools.length} tools available`);
+  console.log(`   Active: ${available.map(t => t.name).join(', ') || 'none'}`);
+  console.log(`   Registered: ${allTools.map(t => t.name).join(', ')}`);
 }

@@ -1,11 +1,16 @@
 import { Router, Request, Response } from 'express';
 import { getConfig } from '../db';
+import { toolRegistry, formatToolResultForProvider } from '../services/tool-registry';
 
 const router = Router();
 
+// ============================================================================
+// Types
+// ============================================================================
+
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
-  content: string;
+  content: string | any[]; // string für normale Nachrichten, array für Anthropic Tool-Blocks
 }
 
 interface ChatRequest {
@@ -15,224 +20,522 @@ interface ChatRequest {
   stream?: boolean;
 }
 
-// Ollama Chat - SIMPLE VERSION
-async function chatWithOllama(url: string, model: string, messages: ChatMessage[], stream: boolean, res: Response) {
-  try {
-    const response = await fetch(`${url}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream,
-      }),
-    });
+// ============================================================================
+// SSE Helpers
+// ============================================================================
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Ollama error: ${error}`);
-    }
+function sendSSE(res: Response, data: object) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+function setupSSE(res: Response) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+}
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
+// ============================================================================
+// ANTHROPIC - Non-Streaming (für Tool-Loop)
+// ============================================================================
 
-      const decoder = new TextDecoder();
-      let buffer = '';
+interface AnthropicResponse {
+  stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence';
+  textContent: string;
+  toolCalls: Array<{
+    id: string;
+    name: string;
+    input: any;
+  }>;
+  rawContent: any[];
+}
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+async function callAnthropicNonStream(
+  apiKey: string,
+  model: string,
+  messages: any[],
+  tools?: any[]
+): Promise<AnthropicResponse> {
+  const body: any = {
+    model,
+    max_tokens: 4096,
+    messages: messages.filter((m) => m.role !== 'system'),
+    system: messages.find((m) => m.role === 'system')?.content,
+  };
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
 
-        for (const line of lines) {
-          if (line.trim()) {
-            try {
-              const data = JSON.parse(line);
-              if (data.message?.content) {
-                res.write(`data: ${JSON.stringify({ content: data.message.content, done: data.done })}\n\n`);
-              }
-              if (data.done) {
-                res.write('data: [DONE]\n\n');
-                res.end();
-                return;
-              }
-            } catch (e) {
-              console.error('Failed to parse line:', line, e);
-            }
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Anthropic error: ${error}`);
+  }
+
+  const data = await response.json() as any;
+
+  const textContent = data.content
+    ?.filter((b: any) => b.type === 'text')
+    .map((b: any) => b.text)
+    .join('') || '';
+
+  const toolCalls = data.content
+    ?.filter((b: any) => b.type === 'tool_use')
+    .map((b: any) => ({
+      id: b.id,
+      name: b.name,
+      input: b.input,
+    })) || [];
+
+  return {
+    stopReason: data.stop_reason,
+    textContent,
+    toolCalls,
+    rawContent: data.content || [],
+  };
+}
+
+// ============================================================================
+// OLLAMA - Non-Streaming (für Tool-Loop)
+// ============================================================================
+
+interface OpenAIStyleResponse {
+  stopReason: 'stop' | 'tool_calls' | 'length';
+  textContent: string;
+  toolCalls: Array<{
+    id: string;
+    name: string;
+    input: any;
+  }>;
+}
+
+async function callOllamaNonStream(
+  url: string,
+  model: string,
+  messages: any[],
+  tools?: any[]
+): Promise<OpenAIStyleResponse> {
+  const body: any = {
+    model,
+    messages,
+    stream: false,
+  };
+
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
+
+  const response = await fetch(`${url}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Ollama error: ${error}`);
+  }
+
+  const data = await response.json() as any;
+  const message = data.message || {};
+  const toolCalls = (message.tool_calls || []).map((tc: any) => ({
+    id: tc.function?.name + '_' + Date.now(),
+    name: tc.function?.name,
+    input: tc.function?.arguments || {},
+  }));
+
+  return {
+    stopReason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+    textContent: message.content || '',
+    toolCalls,
+  };
+}
+
+// ============================================================================
+// LITELLM - Non-Streaming (für Tool-Loop)
+// ============================================================================
+
+async function callLiteLLMNonStream(
+  url: string,
+  apiKey: string,
+  model: string,
+  messages: any[],
+  tools?: any[]
+): Promise<OpenAIStyleResponse> {
+  const body: any = {
+    model,
+    messages,
+    stream: false,
+  };
+
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
+
+  const response = await fetch(`${url}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`LiteLLM error: ${error}`);
+  }
+
+  const data = await response.json() as any;
+  const choice = data.choices?.[0] || {};
+  const message = choice.message || {};
+  const toolCalls = (message.tool_calls || []).map((tc: any) => ({
+    id: tc.id,
+    name: tc.function?.name,
+    input: typeof tc.function?.arguments === 'string'
+      ? JSON.parse(tc.function.arguments)
+      : tc.function?.arguments || {},
+  }));
+
+  return {
+    stopReason: choice.finish_reason === 'tool_calls' ? 'tool_calls' : 'stop',
+    textContent: message.content || '',
+    toolCalls,
+  };
+}
+
+// ============================================================================
+// Streaming: Nur finale Antwort streamen
+// ============================================================================
+
+async function streamOllama(url: string, model: string, messages: any[], res: Response) {
+  const response = await fetch(`${url}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: true }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Ollama stream error: ${error}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const data = JSON.parse(line);
+          if (data.message?.content) {
+            sendSSE(res, { content: data.message.content, done: false });
           }
+          if (data.done) {
+            return;
+          }
+        } catch (e) {
+          // ignore parse errors
         }
       }
-      res.end();
-    } else {
-      const data = await response.json();
-      return data.message?.content || '';
     }
-  } catch (error: any) {
-    console.error('Ollama chat error:', error);
-    throw error;
   }
 }
 
-// LiteLLM Chat - SIMPLE VERSION
-async function chatWithLiteLLM(url: string, apiKey: string, model: string, messages: ChatMessage[], stream: boolean, res: Response) {
-  try {
-    const response = await fetch(`${url}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream,
-      }),
-    });
+async function streamLiteLLM(url: string, apiKey: string, model: string, messages: any[], res: Response) {
+  const response = await fetch(`${url}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model, messages, stream: true }),
+  });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`LiteLLM error: ${error}`);
-    }
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`LiteLLM stream error: ${error}`);
+  }
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
+  const decoder = new TextDecoder();
+  let buffer = '';
 
-      const decoder = new TextDecoder();
-      let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              res.write('data: [DONE]\n\n');
-              res.end();
-              return;
-            }
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              if (content) {
-                res.write(`data: ${JSON.stringify({ content, done: false })}\n\n`);
-              }
-            } catch (e) {
-              console.error('Failed to parse SSE:', line, e);
-            }
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        if (data === '[DONE]') return;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            sendSSE(res, { content, done: false });
           }
+        } catch (e) {
+          // ignore
         }
       }
-      res.end();
-    } else {
-      const data = await response.json();
-      return data.choices?.[0]?.message?.content || '';
     }
-  } catch (error: any) {
-    console.error('LiteLLM chat error:', error);
-    throw error;
   }
 }
 
-// Anthropic Chat - SIMPLE VERSION
-async function chatWithAnthropic(apiKey: string, model: string, messages: ChatMessage[], stream: boolean, res: Response) {
-  try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 4096,
-        messages: messages.filter(m => m.role !== 'system'),
-        system: messages.find(m => m.role === 'system')?.content,
-        stream,
-      }),
-    });
+async function streamAnthropic(apiKey: string, model: string, messages: any[], res: Response) {
+  const body: any = {
+    model,
+    max_tokens: 4096,
+    messages: messages.filter((m) => m.role !== 'system'),
+    system: messages.find((m) => m.role === 'system')?.content,
+    stream: true,
+  };
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Anthropic error: ${error}`);
-    }
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  });
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Anthropic stream error: ${error}`);
+  }
 
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No response body');
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
 
-      const decoder = new TextDecoder();
-      let buffer = '';
+  const decoder = new TextDecoder();
+  let buffer = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              res.write('data: [DONE]\n\n');
-              res.end();
-              return;
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === 'content_block_delta') {
+            const content = parsed.delta?.text;
+            if (content) {
+              sendSSE(res, { content, done: false });
             }
-            try {
-              const parsed = JSON.parse(data);
-              if (parsed.type === 'content_block_delta') {
-                const content = parsed.delta?.text;
-                if (content) {
-                  res.write(`data: ${JSON.stringify({ content, done: false })}\n\n`);
-                }
-              } else if (parsed.type === 'message_stop') {
-                res.write('data: [DONE]\n\n');
-                res.end();
-                return;
-              }
-            } catch (e) {
-              console.error('Failed to parse SSE:', line, e);
-            }
+          } else if (parsed.type === 'message_stop') {
+            return;
           }
+        } catch (e) {
+          // ignore
         }
       }
-      res.end();
-    } else {
-      const data = await response.json();
-      return data.content?.[0]?.text || '';
     }
-  } catch (error: any) {
-    console.error('Anthropic chat error:', error);
-    throw error;
   }
 }
 
-// POST /api/chat - SIMPLE USER CHAT ONLY
+// ============================================================================
+// TOOL-LOOP: Kern-Logik
+// ============================================================================
+
+async function runToolLoop(
+  provider: 'Ollama' | 'LiteLLM' | 'Anthropic',
+  model: string,
+  messages: ChatMessage[],
+  res: Response
+) {
+  const MAX_ITERATIONS = 10;
+  let currentMessages: any[] = [...messages];
+
+  // Verfügbare Tools basierend auf Capabilities
+  const availableTools = toolRegistry.getAvailableTools();
+  const hasTools = availableTools.length > 0;
+
+  console.log(`🔧 Tool-Loop start: ${provider}:${model}, ${availableTools.length} tools available`);
+
+  // Config laden
+  const ollamaUrl = getConfig('llm.ollama.url') || 'http://localhost:11434';
+  const litellmUrl = getConfig('llm.litellm.url') || '';
+  const litellmKey = getConfig('llm.litellm.key') || '';
+  const anthropicKey = getConfig('llm.anthropic.key') || '';
+
+  for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+    console.log(`🔄 Tool-Loop Iteration ${iteration + 1}`);
+
+    // ── Non-Streaming Call (Tool-Erkennung) ─────────────────────────────────
+    let stopReason: string;
+    let textContent: string;
+    let toolCalls: Array<{ id: string; name: string; input: any }>;
+    let rawAnthropicContent: any[] | undefined;
+
+    if (provider === 'Anthropic') {
+      const tools = hasTools ? toolRegistry.getToolsForAnthropic() : undefined;
+      const resp = await callAnthropicNonStream(anthropicKey, model, currentMessages, tools);
+      stopReason = resp.stopReason;
+      textContent = resp.textContent;
+      toolCalls = resp.toolCalls;
+      rawAnthropicContent = resp.rawContent;
+    } else if (provider === 'Ollama') {
+      const tools = hasTools ? toolRegistry.getToolsForOllama() : undefined;
+      const resp = await callOllamaNonStream(ollamaUrl, model, currentMessages, tools);
+      stopReason = resp.stopReason;
+      textContent = resp.textContent;
+      toolCalls = resp.toolCalls;
+    } else if (provider === 'LiteLLM') {
+      const tools = hasTools ? toolRegistry.getToolsForOpenAI() : undefined;
+      const resp = await callLiteLLMNonStream(litellmUrl, litellmKey, model, currentMessages, tools);
+      stopReason = resp.stopReason;
+      textContent = resp.textContent;
+      toolCalls = resp.toolCalls;
+    } else {
+      throw new Error(`Unknown provider: ${provider}`);
+    }
+
+    // ── Finale Antwort (kein Tool-Call) ─────────────────────────────────────
+    const isToolCall = stopReason === 'tool_use' || stopReason === 'tool_calls';
+
+    if (!isToolCall || toolCalls!.length === 0) {
+      console.log(`✅ Finale Antwort nach ${iteration + 1} Iteration(en)`);
+      // Bereits gesammelten Text senden wenn vorhanden
+      if (textContent) {
+        sendSSE(res, { content: textContent, done: false });
+      }
+      return; // Tool-Loop beendet
+    }
+
+    // ── Tool-Calls verarbeiten ───────────────────────────────────────────────
+    console.log(`🔧 ${toolCalls!.length} Tool(s) aufgerufen:`, toolCalls!.map((t) => t.name));
+
+    // Assistant-Nachricht zur History hinzufügen
+    if (provider === 'Anthropic') {
+      currentMessages.push({ role: 'assistant', content: rawAnthropicContent });
+    } else {
+      // OpenAI-Style: tool_calls in der Nachricht
+      const assistantMsg: any = {
+        role: 'assistant',
+        content: textContent || null,
+        tool_calls: toolCalls!.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+        })),
+      };
+      currentMessages.push(assistantMsg);
+    }
+
+    // Tools ausführen und Ergebnisse sammeln
+    const toolResultsForAnthropic: any[] = [];
+    const toolResultsForOpenAI: any[] = [];
+
+    for (const toolCall of toolCalls!) {
+      // Tool-Use-Event an Client senden
+      sendSSE(res, {
+        type: 'tool_use',
+        tool_name: toolCall.name,
+        tool_input: toolCall.input,
+      });
+
+      // Tool ausführen
+      const result = await toolRegistry.executeTool(toolCall.name, toolCall.input);
+
+      if (result.success) {
+        sendSSE(res, {
+          type: 'tool_result',
+          tool_name: toolCall.name,
+          result: result.data,
+        });
+      } else {
+        sendSSE(res, {
+          type: 'tool_error',
+          tool_name: toolCall.name,
+          error: result.error,
+        });
+      }
+
+      // Ergebnis für Provider formatieren
+      const formattedResult = formatToolResultForProvider(
+        provider,
+        toolCall.id,
+        result
+      );
+
+      if (provider === 'Anthropic') {
+        toolResultsForAnthropic.push(formattedResult);
+      } else {
+        toolResultsForOpenAI.push(formattedResult);
+      }
+    }
+
+    // Tool-Ergebnisse zur History hinzufügen
+    if (provider === 'Anthropic') {
+      currentMessages.push({ role: 'user', content: toolResultsForAnthropic });
+    } else {
+      // OpenAI-Style: jedes Tool-Ergebnis als eigene Nachricht
+      for (const toolResult of toolResultsForOpenAI) {
+        currentMessages.push(toolResult);
+      }
+    }
+
+    // → Weiter zum nächsten Loop-Durchlauf
+  }
+
+  // Sicherheitslimit erreicht
+  console.warn('⚠️ Tool-Loop Sicherheitslimit (10 Iterationen) erreicht');
+  sendSSE(res, {
+    content: 'Maximale Tool-Iterationen erreicht. Bitte versuche es erneut.',
+    done: false,
+  });
+}
+
+// ============================================================================
+// MCP Status (bestehender Endpoint - beibehalten)
+// ============================================================================
+
+router.get('/mcp/status', (req, res) => {
+  res.json({
+    initialized: false,
+    servers: [],
+    toolCount: 0,
+  });
+});
+
+// ============================================================================
+// POST /api/chat - Haupt-Chat-Endpoint mit Tool-Loop
+// ============================================================================
+
 router.post('/', async (req: Request, res: Response) => {
   try {
     const { provider, model, messages, stream = true } = req.body as ChatRequest;
@@ -243,31 +546,42 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Route to appropriate provider - NO MCP HERE!
-    if (provider === 'Ollama') {
-      const url = getConfig('llm.ollama.url') || 'http://localhost:11434';
-      await chatWithOllama(url, model, messages, stream, res);
-    } else if (provider === 'LiteLLM') {
-      const url = getConfig('llm.litellm.url');
-      const apiKey = getConfig('llm.litellm.key');
-      if (!url || !apiKey) {
-        return res.status(400).json({ error: 'LiteLLM not configured' });
+    // SSE-Header immer setzen (auch für Tool-Loop Events)
+    setupSSE(res);
+
+    try {
+      // Tool-Loop ausführen (kümmert sich um Tool-Calls + finale Antwort)
+      await runToolLoop(provider, model, messages, res);
+    } catch (loopError: any) {
+      console.error('Tool-Loop error:', loopError);
+      // Fallback: Direkt streamen ohne Tools
+      console.log('⚠️ Fallback: Streaming ohne Tool-Loop');
+
+      const ollamaUrl = getConfig('llm.ollama.url') || 'http://localhost:11434';
+      const litellmUrl = getConfig('llm.litellm.url') || '';
+      const litellmKey = getConfig('llm.litellm.key') || '';
+      const anthropicKey = getConfig('llm.anthropic.key') || '';
+
+      if (provider === 'Ollama') {
+        await streamOllama(ollamaUrl, model, messages, res);
+      } else if (provider === 'LiteLLM') {
+        await streamLiteLLM(litellmUrl, litellmKey, model, messages, res);
+      } else if (provider === 'Anthropic') {
+        await streamAnthropic(anthropicKey, model, messages, res);
       }
-      await chatWithLiteLLM(url, apiKey, model, messages, stream, res);
-    } else if (provider === 'Anthropic') {
-      const apiKey = getConfig('llm.anthropic.key');
-      if (!apiKey) {
-        return res.status(400).json({ error: 'Anthropic not configured' });
-      }
-      await chatWithAnthropic(apiKey, model, messages, stream, res);
-    } else {
-      return res.status(400).json({ error: 'Unknown provider' });
     }
+
+    // Stream beenden
+    sendSSE(res, { done: true });
+    res.write('data: [DONE]\n\n');
+    res.end();
   } catch (error: any) {
     console.error('Chat error:', error);
     if (!res.headersSent) {
       res.status(500).json({ error: error.message });
     } else {
+      sendSSE(res, { error: error.message });
+      res.write('data: [DONE]\n\n');
       res.end();
     }
   }

@@ -9,6 +9,7 @@ import conversationsRouter from './api/conversations';
 import mcpRouter from './api/mcp';
 import mcpManagerRouter from './api/mcp-manager';
 import toolsRouter from './api/tools';
+import mediaRouter from './api/media';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -32,7 +33,8 @@ app.use('/api/chat', chatRouter);
 app.use('/api/conversations', conversationsRouter);
 app.use('/api/mcp', mcpRouter); // MCP one-click install
 app.use('/api/mcp-manager', mcpManagerRouter); // MCP health/status/tools
-app.use('/api/tools', toolsRouter); // Tool Registry API
+app.use('/api/tools', toolsRouter);   // Tool Registry API
+app.use('/api/media', mediaRouter);   // TTS, Image-Gen, Media files
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -48,5 +50,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 GogoChat API running on http://localhost:${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
   console.log(`⚙️  Settings API: http://localhost:${PORT}/api/settings`);
+  console.log(`🎨 Media API:    http://localhost:${PORT}/api/media/status`);
+  console.log(`🔧 Tools API:    http://localhost:${PORT}/api/tools`);
   console.log(`\n💡 Next: Set up your first LLM in the settings!\n`);
 });
