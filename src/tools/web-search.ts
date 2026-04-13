@@ -57,7 +57,7 @@ export async function handleWebSearch(input: {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
 
     // DuckDuckGo Ergebnisse formatieren
     const results = [];

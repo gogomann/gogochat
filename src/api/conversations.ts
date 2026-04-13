@@ -41,7 +41,7 @@ router.post('/', (req: Request, res: Response) => {
 // GET /api/conversations/:id - Get single conversation
 router.get('/:id', (req: Request, res: Response) => {
   try {
-    const conversation = getConversation(req.params.id);
+    const conversation = getConversation(req.params.id as string);
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
@@ -60,8 +60,8 @@ router.patch('/:id', (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Title is required' });
     }
 
-    updateConversationTitle(req.params.id, title);
-    console.log(`✏️  Renamed conversation ${req.params.id} to: ${title}`);
+    updateConversationTitle(req.params.id as string, title);
+    console.log(`✏️  Renamed conversation ${req.params.id as string} to: ${title}`);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Update conversation error:', error);
@@ -72,8 +72,8 @@ router.patch('/:id', (req: Request, res: Response) => {
 // DELETE /api/conversations/:id - Delete conversation
 router.delete('/:id', (req: Request, res: Response) => {
   try {
-    deleteConversation(req.params.id);
-    console.log(`🗑️  Deleted conversation: ${req.params.id}`);
+    deleteConversation(req.params.id as string);
+    console.log(`🗑️  Deleted conversation: ${req.params.id as string}`);
     res.json({ success: true });
   } catch (error: any) {
     console.error('Delete conversation error:', error);
@@ -84,7 +84,7 @@ router.delete('/:id', (req: Request, res: Response) => {
 // GET /api/conversations/:id/messages - Get messages for conversation
 router.get('/:id/messages', (req: Request, res: Response) => {
   try {
-    const messages = getMessages(req.params.id);
+    const messages = getMessages(req.params.id as string);
     res.json(messages);
   } catch (error: any) {
     console.error('Get messages error:', error);
@@ -100,7 +100,7 @@ router.post('/:id/messages', (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Role and content are required' });
     }
 
-    const message = addMessage(req.params.id, role, content, model);
+    const message = addMessage(req.params.id as string, role, content, model);
     res.json(message);
   } catch (error: any) {
     console.error('Add message error:', error);
@@ -111,12 +111,12 @@ router.post('/:id/messages', (req: Request, res: Response) => {
 // GET /api/conversations/:id/export - Export conversation as markdown
 router.get('/:id/export', (req: Request, res: Response) => {
   try {
-    const conversation = getConversation(req.params.id);
+    const conversation = getConversation(req.params.id as string);
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
 
-    const messages = getMessages(req.params.id);
+    const messages = getMessages(req.params.id as string);
 
     // Create markdown content
     let markdown = `# ${conversation.title}\n\n`;

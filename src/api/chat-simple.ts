@@ -72,7 +72,7 @@ async function chatWithOllama(url: string, model: string, messages: ChatMessage[
       }
       res.end();
     } else {
-      const data = await response.json();
+      const data = await response.json() as any;
       return data.message?.content || '';
     }
   } catch (error: any) {
@@ -143,7 +143,7 @@ async function chatWithLiteLLM(url: string, apiKey: string, model: string, messa
       }
       res.end();
     } else {
-      const data = await response.json();
+      const data = await response.json() as any;
       return data.choices?.[0]?.message?.content || '';
     }
   } catch (error: any) {
@@ -223,7 +223,7 @@ async function chatWithAnthropic(apiKey: string, model: string, messages: ChatMe
       }
       res.end();
     } else {
-      const data = await response.json();
+      const data = await response.json() as any;
       return data.content?.[0]?.text || '';
     }
   } catch (error: any) {

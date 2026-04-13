@@ -21,7 +21,7 @@ export async function testOllama(url: string): Promise<LLMTestResult> {
       };
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     const models = data.models?.map((m: any) => m.name) || [];
 
     return {
@@ -70,7 +70,7 @@ export async function testLiteLLM(
       };
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     const models = data.data?.map((m: any) => m.id) || [];
 
     return {
