@@ -14,10 +14,31 @@ interface ChatMessage {
 }
 
 interface ChatRequest {
-  provider: 'Ollama' | 'LiteLLM' | 'Anthropic';
+  provider: string; // 'Ollama' | 'LiteLLM' | 'Anthropic' | dynamic provider name
   model: string;
   messages: ChatMessage[];
   stream?: boolean;
+}
+
+// Dynamic provider config from DB
+interface DynamicProviderConfig {
+  id: string;
+  name: string;
+  type: string;
+  url?: string;
+  apiKey?: string;
+  customHeaders?: Record<string, string>;
+}
+
+function getDynamicProvider(providerName: string): DynamicProviderConfig | null {
+  try {
+    const providersJson = getConfig('providers');
+    if (!providersJson) return null;
+    const providers = JSON.parse(providersJson) as DynamicProviderConfig[];
+    return providers.find(p => p.name === providerName) || null;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================
@@ -368,11 +389,120 @@ async function streamAnthropic(apiKey: string, model: string, messages: any[], r
 }
 
 // ============================================================================
+// OPENAI-COMPATIBLE (Custom/Dynamic) - Non-Streaming & Streaming
+// ============================================================================
+
+async function callOpenAICompatibleNonStream(
+  url: string,
+  apiKey: string,
+  model: string,
+  messages: any[],
+  customHeaders?: Record<string, string>,
+  tools?: any[]
+): Promise<OpenAIStyleResponse> {
+  const body: any = { model, messages, stream: false };
+  if (tools && tools.length > 0) body.tools = tools;
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(customHeaders || {}),
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const baseUrl = url.replace(/\/+$/, '');
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI-compatible error (${response.status}): ${error}`);
+  }
+
+  const data = await response.json() as any;
+  const choice = data.choices?.[0] || {};
+  const message = choice.message || {};
+  const toolCalls = (message.tool_calls || []).map((tc: any) => ({
+    id: tc.id,
+    name: tc.function?.name,
+    input: typeof tc.function?.arguments === 'string'
+      ? JSON.parse(tc.function.arguments)
+      : tc.function?.arguments || {},
+  }));
+
+  return {
+    stopReason: choice.finish_reason === 'tool_calls' ? 'tool_calls' : 'stop',
+    textContent: message.content || '',
+    toolCalls,
+  };
+}
+
+async function streamOpenAICompatible(
+  url: string,
+  apiKey: string,
+  model: string,
+  messages: any[],
+  res: Response,
+  customHeaders?: Record<string, string>
+) {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(customHeaders || {}),
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const baseUrl = url.replace(/\/+$/, '');
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model, messages, stream: true }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI-compatible stream error (${response.status}): ${error}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const data = line.slice(6);
+        if (data === '[DONE]') return;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            sendSSE(res, { content, done: false });
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+  }
+}
+
+// ============================================================================
 // TOOL-LOOP: Kern-Logik
 // ============================================================================
 
 async function runToolLoop(
-  provider: 'Ollama' | 'LiteLLM' | 'Anthropic',
+  provider: string,
   model: string,
   messages: ChatMessage[],
   res: Response
@@ -421,7 +551,14 @@ async function runToolLoop(
       textContent = resp.textContent;
       toolCalls = resp.toolCalls;
     } else {
-      throw new Error(`Unknown provider: ${provider}`);
+      // Dynamic provider lookup
+      const dynProvider = getDynamicProvider(provider);
+      if (!dynProvider || !dynProvider.url) throw new Error(`Unknown provider: ${provider}`);
+      const tools = hasTools ? toolRegistry.getToolsForOpenAI() : undefined;
+      const resp = await callOpenAICompatibleNonStream(dynProvider.url, dynProvider.apiKey || '', model, currentMessages, dynProvider.customHeaders, tools);
+      stopReason = resp.stopReason;
+      textContent = resp.textContent;
+      toolCalls = resp.toolCalls;
     }
 
     // ── Finale Antwort (kein Tool-Call) ─────────────────────────────────────
@@ -568,6 +705,12 @@ router.post('/', async (req: Request, res: Response) => {
         await streamLiteLLM(litellmUrl, litellmKey, model, messages, res);
       } else if (provider === 'Anthropic') {
         await streamAnthropic(anthropicKey, model, messages, res);
+      } else {
+        // Dynamic provider fallback
+        const dynProvider = getDynamicProvider(provider);
+        if (dynProvider?.url) {
+          await streamOpenAICompatible(dynProvider.url, dynProvider.apiKey || '', model, messages, res, dynProvider.customHeaders);
+        }
       }
     }
 

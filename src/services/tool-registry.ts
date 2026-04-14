@@ -237,7 +237,7 @@ export const toolRegistry = new ToolRegistry();
  * Formatiert Tool-Ergebnisse für verschiedene LLM-Provider
  */
 export function formatToolResultForProvider(
-  provider: 'Anthropic' | 'LiteLLM' | 'Ollama',
+  provider: string,
   toolUseId: string,
   result: ToolResult
 ): any {
